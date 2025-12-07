@@ -6,10 +6,12 @@ pub fn compute_fbank(samples: &[f32]) -> Result<Array2<f32>> {
         bail!("The samples array is empty. No features to compute.")
     }
 
+    let scaled_samples: Vec<f32> = samples.iter().map(|&x| x * 32768.0).collect();
+
     let mut result = unsafe {
         knf_rs_sys::ComputeFbank(
-            samples.as_ptr(),
-            samples.len().try_into().context("samples len")?,
+            scaled_samples.as_ptr(),
+            scaled_samples.len().try_into().context("samples len")?,
         )
     };
 

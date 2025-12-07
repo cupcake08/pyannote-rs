@@ -9,15 +9,22 @@ license = "MIT"
 description = "Speaker diarization using pyannote in Rust"
 repository = "https://github.com/thewh1teagle/pyannote-rs"
 
+[lib]
+name = "pyannote_rs"
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 eyre = "0.6.12"
 hound = "3.5.1"
 ndarray = "0.16"
 ort = { version = "2.0.0-rc.10", features = ["ndarray"] }
 knf-rs = { path = "crates/knf-rs", version = "0.3.2", features = [] }
+pyo3 = { version = "0.23.3", features = ["extension-module"], optional = true }
 
+ndarray-npy = { version = "0.9.1", default-features = false, features = ["npz"] }
 [features]
-default = []
+default = ["python"]
+python = ["dep:pyo3"]
 coreml = ["ort/coreml"]
 directml = ["ort/directml"]
 load-dynamic = ["ort/load-dynamic"]

@@ -24,6 +24,8 @@ fn find_max_index(row: ArrayBase<ViewRepr<&f32>, IxDyn>) -> Result<usize> {
     Ok(max_index)
 }
 
+use ort::session::Session;
+
 pub fn get_segments<P: AsRef<Path>>(
     samples: &[i16],
     sample_rate: u32,
@@ -59,17 +61,18 @@ pub fn get_segments<P: AsRef<Path>>(
             let array = ndarray::Array1::from_iter(window.iter().map(|&x| x as f32));
             let array = array.view().insert_axis(Axis(0)).insert_axis(Axis(1));
 
-            // Handle potential errors during the session and input processing
-            let inputs = ort::inputs![ort::value::TensorRef::from_array_view(array.into_dyn())
-                .map_err(|e| eyre::eyre!("Failed to prepare inputs: {:?}", e))
-                .ok()?];
+            let inputs = ort::inputs![
+                "input_values" => ort::value::TensorRef::from_array_view(array.into_dyn())
+                    .map_err(|e| eyre::eyre!("Failed to prepare inputs: {:?}", e))
+                    .ok()?
+            ];
 
             let ort_outs = match session.run(inputs) {
                 Ok(outputs) => outputs,
                 Err(e) => return Some(Err(eyre::eyre!("Failed to run the session: {:?}", e))),
             };
 
-            let ort_out = match ort_outs.get("output").context("Output tensor not found") {
+            let ort_out = match ort_outs.get("logits").context("Output tensor not found") {
                 Ok(output) => output,
                 Err(e) => return Some(Err(eyre::eyre!("Output tensor error: {:?}", e))),
             };
@@ -82,8 +85,7 @@ pub fn get_segments<P: AsRef<Path>>(
                 Err(e) => return Some(Err(eyre::eyre!("Tensor extraction error: {:?}", e))),
             };
 
-            let (shape, data) = ort_out; // (&Shape, &[f32])
-                                         // Fix: shape is &Shape, but from_shape expects &[usize]
+            let (shape, data) = ort_out;
             let shape_slice: Vec<usize> = (0..shape.len()).map(|i| shape[i] as usize).collect();
             let view =
                 ndarray::ArrayViewD::<f32>::from_shape(ndarray::IxDyn(&shape_slice), data).unwrap();
@@ -129,3 +131,123 @@ pub fn get_segments<P: AsRef<Path>>(
         segments_queue.pop_front().map(Ok)
     }))
 }
+
+pub fn get_segments_with_session<'a>(
+    samples: &'a [i16],
+    sample_rate: u32,
+    session: &'a mut Session,
+) -> Result<impl Iterator<Item = Result<Segment>> + 'a> {
+    let frame_size = 270;
+    let frame_start = 721;
+    let window_size = (sample_rate * 10) as usize; // 10 seconds
+    let mut is_speeching = false;
+    let mut offset = frame_start;
+    let mut start_offset = 0.0;
+
+    // Pad end with silence for full last segment
+    let padded_samples = {
+        let mut padded = Vec::from(samples);
+        padded.extend(vec![0; window_size - (samples.len() % window_size)]);
+        padded
+    };
+
+    let mut start_iter = (0..padded_samples.len()).step_by(window_size);
+
+    let mut segments_queue = VecDeque::new();
+
+    Ok(std::iter::from_fn(move || {
+        if let Some(start) = start_iter.next() {
+            let end = (start + window_size).min(padded_samples.len());
+            let window = &padded_samples[start..end];
+
+            // Convert window to ndarray::Array1
+            let array = ndarray::Array1::from_iter(window.iter().map(|&x| x as f32));
+            let array = array.view().insert_axis(Axis(0)).insert_axis(Axis(1));
+
+            let inputs = ort::inputs![
+                "input_values" => ort::value::TensorRef::from_array_view(array.into_dyn())
+                    .map_err(|e| eyre::eyre!("Failed to prepare inputs: {:?}", e))
+                    .ok()?
+            ];
+
+            let ort_outs = match session.run(inputs) {
+                Ok(outputs) => outputs,
+                Err(e) => return Some(Err(eyre::eyre!("Failed to run the session: {:?}", e))),
+            };
+
+            let ort_out = match ort_outs.get("logits").context("Output tensor not found") {
+                Ok(output) => output,
+                Err(e) => return Some(Err(eyre::eyre!("Output tensor error: {:?}", e))),
+            };
+
+            let ort_out = match ort_out
+                .try_extract_tensor::<f32>()
+                .context("Failed to extract tensor")
+            {
+                Ok(tensor) => tensor,
+                Err(e) => return Some(Err(eyre::eyre!("Tensor extraction error: {:?}", e))),
+            };
+
+            let (shape, data) = ort_out;
+            let shape_slice: Vec<usize> = (0..shape.len()).map(|i| shape[i] as usize).collect();
+            let view =
+                ndarray::ArrayViewD::<f32>::from_shape(ndarray::IxDyn(&shape_slice), data).unwrap();
+
+            for row in view.outer_iter() {
+                for sub_row in row.axis_iter(Axis(0)) {
+                    let max_index = match find_max_index(sub_row) {
+                        Ok(index) => index,
+                        Err(e) => return Some(Err(e)),
+                    };
+
+                    if max_index != 0 {
+                        if !is_speeching {
+                            start_offset = offset as f64;
+                            is_speeching = true;
+                        }
+                    } else if is_speeching {
+                        let start = start_offset / sample_rate as f64;
+                        let end = offset as f64 / sample_rate as f64;
+
+                        let start_f64 = start * (sample_rate as f64);
+                        let end_f64 = end * (sample_rate as f64);
+
+                        // Ensure indices are within bounds
+                        let start_idx = start_f64.min((samples.len() - 1) as f64) as usize;
+                        let end_idx = end_f64.min(samples.len() as f64) as usize;
+
+                        let segment_samples = &padded_samples[start_idx..end_idx];
+
+                        is_speeching = false;
+
+                        let segment = Segment {
+                            start,
+                            end,
+                            samples: segment_samples.to_vec(),
+                        };
+                        segments_queue.push_back(segment);
+                    }
+                    offset += frame_size;
+                }
+            }
+        }
+        segments_queue.pop_front().map(Ok)
+    }))
+}
+
+// Helper to avoid duplication if possible, but for now I'll just keep get_segments as is
+// or implement it by creating a session and then calling a shared internal function?
+// The issue is ownership. get_segments owns the session. get_segments_with_session borrows it.
+// I'll leave get_segments as is (it works for CLI examples) and add get_segments_with_session for Python.
+// To avoid duplication, I can make a generic trait or macro, but copy-paste is safer for now to avoid breaking things.
+// Wait, I can't easily copy-paste because I'm replacing the file content.
+// I will REPLACE get_segments with a version that calls get_segments_internal (which takes ownership)
+// AND add get_segments_with_session (which takes reference).
+// Actually, `ort::Session` is not easily cloneable? It is `Arc` internally?
+// If `Session` is cheap to clone (Arc), I can just clone it.
+// Checking ort docs... Session usually wraps a C++ pointer.
+// If I can clone Session, I can have one implementation.
+// But let's assume I can't.
+
+// I'll just add `get_segments_with_session` and duplicate the logic for now.
+// It's ugly but safe.
