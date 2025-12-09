@@ -2,3 +2,5 @@ target/
 build/
 *.onnx
 *.wav
+
+.DS_Store
